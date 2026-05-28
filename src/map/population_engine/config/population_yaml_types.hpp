@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <common/mmo.hpp> // t_itemid
+
 struct script_code;
 
 /// Optional per-job attack skill list (db/population_engine.yml `Skills:` sequence).
