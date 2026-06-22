@@ -1,0 +1,472 @@
+diff --git a/src/map/atcommand.cpp b/src/map/atcommand.cpp
+index 1e70bbac7..18a3783c3 100644
+--- a/src/map/atcommand.cpp
++++ b/src/map/atcommand.cpp
+@@ -54,6 +54,7 @@
+ #include "storage.hpp"
+ #include "trade.hpp"
+ #include "vending.hpp"
++#include <unordered_set>
+ 
+ using namespace rathena;
+ 
+@@ -10901,6 +11106,363 @@ ACMD_FUNC(cloneequip) {
+ 	return 0;
+ }
+ 
++/*==========================================
++ * Commands
++ * @autoattack on
++ * @autoattack +<mobID>
++ * @autoattack -<mobID>
++ * @autoattack list
++ * @autoattack off
++ *------------------------------------------
++ * Credits:
++ *  Author - goddameit
++ * 	zomba44 (Code Update)
++ *  Remix (Additional Commands)
++ *------------------------------------------*/
++static int buildin_autoattack_sub(struct block_list* bl, va_list ap) {
++	struct block_list* src = va_arg(ap, struct block_list*);
++	int* target_id = va_arg(ap, int*);
++	struct mob_data** md2 = va_arg(ap, struct mob_data**);
++
++	int dist = distance_bl(src, bl);
++	if (*target_id == 0 || dist < distance_bl(src, map_id2bl(*target_id))) {
++		*target_id = bl->id;
++		*md2 = BL_CAST(BL_MOB, bl);
++	}
++	return 1;
++}
++
++TIMER_FUNC(autoattack_timer);
++TIMER_FUNC(autoskill_timer);
++
++void autoattack_motion(map_session_data* sd, int mob_id) {
++	int target_id = 0;
++	struct mob_data* md2 = nullptr;
++	struct unit_data* ud = unit_bl2ud(sd);
++	int range = sd->autoskill_range > 0 ? sd->autoskill_range : 11;
++
++	map_foreachinarea(buildin_autoattack_sub, sd->m, sd->x - range, sd->y - range, sd->x + range, sd->y + range, BL_MOB, sd, &target_id, &md2);
++
++	
++
++	if (target_id) {
++		block_list* tbl = map_id2bl(target_id);
++		if (status_check_visibility(sd, tbl, false))
++			unit_attack(sd, target_id, 1);
++	}
++}
++
++bool autoskill_motion(map_session_data* sd) {
++	int target_id = 0;
++	struct mob_data* md2 = nullptr;
++	struct unit_data* ud = unit_bl2ud(sd);
++	if (ud == nullptr)
++		return false;
++	int range = sd->autoskill_range > 0 ? sd->autoskill_range : 11;
++
++	map_foreachinarea(buildin_autoattack_sub, sd->m, sd->x - range, sd->y - range, sd->x + range, sd->y + range, BL_MOB, sd, &target_id, &md2);
++
++	if (!target_id)
++		return false;
++
++	if (md2 != nullptr && status_has_mode(&md2->status,
++		MD_IGNOREMAGIC | MD_IGNOREMELEE | MD_IGNORERANGED |
++		MD_IGNOREMISC | MD_KNOCKBACKIMMUNE))
++		return false;
++
++	block_list* tbl = map_id2bl(target_id);
++	for (int s = 0; s < 5; s++) {
++		uint16 skill_id = sd->autoskill[s].skill_id;
++		uint16 skill_lv = sd->autoskill[s].skill_lv;
++		if (skill_id == 0 ||
++			pc_checkskill(sd, skill_id) < skill_lv ||
++			sd->battle_status.sp < skill_get_sp(skill_id, skill_lv) ||
++			sd->battle_status.ap < skill_get_ap(skill_id, skill_lv) ||
++			tbl == nullptr
++			)
++			continue;
++		bool is_self_skill = skill_get_inf(skill_id) & INF_SELF_SKILL;
++		if (!is_self_skill && !status_check_skilluse(sd, tbl, skill_id, 0))
++			continue;
++		if (is_self_skill) {
++			// Self skills with splash > 0 require an enemy within that radius
++			// Self skills with splash == 0 are pure buffs and fire unconditionally
++			int32 splash = skill_get_splash(skill_id, skill_lv);
++			if (splash > 0 && !battle_check_range(sd, tbl, splash))
++				continue;
++		}
++		else {
++			if (!battle_check_range(sd, tbl, skill_get_range2(sd, skill_id, skill_lv, true)))
++				continue;
++		}
++		// Correct - if the entry exists, skill is still on cooldown
++		if (sd->scd.find(skill_id) != sd->scd.end())
++			continue;
++
++		// Actual skill use section.
++		if (skill_get_inf(skill_id) & INF_GROUND_SKILL)
++			unit_skilluse_pos(sd, tbl->x, tbl->y, skill_id, skill_lv);
++		else if (is_self_skill)
++			unit_skilluse_id(sd, sd->id, skill_id, skill_lv);
++		else {
++			// Don't try to target cloaked units with attack skills as they will fail. 
++			if (!status_check_visibility(sd, tbl, false))
++				continue;
++			unit_skilluse_id(sd, target_id, skill_id, skill_lv);
++		}
++		return true;
++	}
++	return false;
++}
++
++ACMD_FUNC(autoskill) {
++	nullpo_retr(-1, sd);
++
++	if (!message || !*message) {
++		clif_displaymessage(fd, "Usage:");
++		clif_displaymessage(fd, "@autoskill on - Activate autoskill");
++		clif_displaymessage(fd, "@autoskill off - Deactivate autoskill");
++		clif_displaymessage(fd, "@autoskill +<skill_id or name> <level> - Add skill to list");
++		clif_displaymessage(fd, "@autoskill -<skill_id or name> - Remove skill from list");
++		clif_displaymessage(fd, "@autoskill list - Show current skills");
++		clif_displaymessage(fd, "@autoskill clear - Clear all skills");
++		clif_displaymessage(fd, "@autoskill range <1-11> - Set target detection range (default 11)");
++		return 0;
++	}
++
++	if (strcmp(message, "on") == 0) {
++		sd->state.autoskill = 1;
++		add_timer(gettick() + 2000, autoskill_timer, sd->id, 0);
++		clif_displaymessage(fd, "Auto Skill is now activated.");
++		return 0;
++	}
++
++	if (strcmp(message, "off") == 0) {
++		sd->state.autoskill = 0;
++		clif_displaymessage(fd, "Auto Skill has been deactivated.");
++		return 0;
++	}
++
++	if (strcmp(message, "clear") == 0) {
++		for (int i = 0; i < 5; i++) {
++			sd->autoskill[i].skill_id = 0;
++			sd->autoskill[i].skill_lv = 0;
++		}
++		clif_displaymessage(fd, "All autoskill slots cleared.");
++		return 0;
++	}
++
++	if (strcmp(message, "list") == 0) {
++		clif_displaymessage(fd, "Autoskill list:");
++		bool any = false;
++		for (int i = 0; i < 5; i++) {
++			if (sd->autoskill[i].skill_id == 0)
++				continue;
++			char output[CHAT_SIZE_MAX];
++			sprintf(output, "  [%d] %s (ID: %d), Level %d", i + 1, skill_get_desc(sd->autoskill[i].skill_id), sd->autoskill[i].skill_id, sd->autoskill[i].skill_lv);
++			clif_displaymessage(fd, output);
++			any = true;
++		}
++		if (!any)
++			clif_displaymessage(fd, "  (empty)");
++		return 0;
++	}
++
++	if (message[0] == '+') {
++		int skill_id_in, skill_lv;
++		uint16 skill_id = 0;
++		const char* args = message + 1;
++
++		// Try numeric ID first
++		if (sscanf(args, "%d %d", &skill_id_in, &skill_lv) == 2) {
++			skill_id = (uint16)skill_id_in;
++		}
++		else {
++			// Try name lookup — split on last space to separate name from level
++			const char* lv_str = strrchr(args, ' ');
++			if (lv_str == nullptr || sscanf(lv_str + 1, "%d", &skill_lv) != 1) {
++				clif_displaymessage(fd, "Invalid syntax. Usage: @autoskill +<skill_id or name> <level>");
++				return -1;
++			}
++			char name_buf[SKILL_NAME_LENGTH];
++			size_t name_len = lv_str - args;
++			if (name_len >= sizeof(name_buf))
++				name_len = sizeof(name_buf) - 1;
++			strncpy(name_buf, args, name_len);
++			name_buf[name_len] = '\0';
++			skill_id = skilldb_searchname(name_buf);
++			if (skill_id == 0) {
++				clif_displaymessage(fd, "Skill not found. Check the name and try again.");
++				return -1;
++			}
++		}
++		if (skill_lv < 1) {
++			clif_displaymessage(fd, "Level must be at least 1.");
++			return -1;
++		}
++		if (pc_checkskill(sd, skill_id) < skill_lv) {
++			clif_displaymessage(fd, "You do not have that skill at the specified level.");
++			return -1;
++		}
++		// Check if already in list
++		for (int i = 0; i < 5; i++) {
++			if (sd->autoskill[i].skill_id == skill_id) {
++				clif_displaymessage(fd, "That skill is already in the list.");
++				return -1;
++			}
++		}
++		// Find first empty slot
++		for (int i = 0; i < 5; i++) {
++			if (sd->autoskill[i].skill_id == 0) {
++				sd->autoskill[i].skill_id = skill_id;
++				sd->autoskill[i].skill_lv = (uint16)skill_lv;
++				char output[CHAT_SIZE_MAX];
++				sprintf(output, "Added: [%d] %s (Level %d)", skill_id, skill_get_desc(skill_id), skill_lv);
++				clif_displaymessage(fd, output);
++				return 0;
++			}
++		}
++		clif_displaymessage(fd, "Autoskill list is full (max 5).");
++		return -1;
++	}
++
++	if (message[0] == '-') {
++		int skill_id_in = 0;
++		uint16 skill_id = 0;
++		const char* args = message + 1;
++
++		// Try numeric ID first
++		if (sscanf(args, "%d", &skill_id_in) == 1) {
++			skill_id = (uint16)skill_id_in;
++		}
++		else {
++			// Try name lookup
++			skill_id = skilldb_searchname(args);
++			if (skill_id == 0) {
++				clif_displaymessage(fd, "Skill not found. Check the name and try again.");
++				return -1;
++			}
++		}
++		for (int i = 0; i < 5; i++) {
++			if (sd->autoskill[i].skill_id == skill_id) {
++				sd->autoskill[i].skill_id = 0;
++				sd->autoskill[i].skill_lv = 0;
++				clif_displaymessage(fd, "Skill removed from autoskill list.");
++				return 0;
++			}
++		}
++		clif_displaymessage(fd, "That skill is not in the list.");
++		return -1;
++	}
++
++	if (strncmp(message, "range ", 6) == 0) {
++		int range;
++		if (sscanf(message + 6, "%d", &range) != 1 || range < 1 || range > 11) {
++			clif_displaymessage(fd, "Invalid range. Usage: @autoskill range <1-11>");
++			return -1;
++		}
++		sd->autoskill_range = (uint8)range;
++		char output[CHAT_SIZE_MAX];
++		sprintf(output, "Auto skill detection range set to %d.", range);
++		clif_displaymessage(fd, output);
++		return 0;
++	}
++
++	clif_displaymessage(fd, "Invalid syntax. Type @autoskill for usage.");
++	return -1;
++}
++
++static TIMER_FUNC(autoskill_timer) {
++	map_session_data* sd = map_id2sd(id);
++
++	if (sd == nullptr)
++		return 0;
++	if (sd->state.autoskill) {
++		t_tick next = gettick() + 125;
++		bool skill_used = autoskill_motion(sd);
++		if (skill_used) {
++			next = i64max(next, sd->ud.canact_tick);
++		}
++		if (sd->state.autoattack) {
++			autoattack_motion(sd, 0);
++		}
++		
++		add_timer(next, autoskill_timer, sd->id, 0);
++	}
++	return 0;
++}
++
++static TIMER_FUNC(autoattack_timer) {
++	map_session_data* sd = map_id2sd(id);
++	int mob_id = (int)data;
++
++	if (sd == nullptr)
++		return 0;
++	if (sd->state.autoattack) {
++		// If autoskill is also on, skills get priority — autoskill_timer handles skills,
++		// so here we only fire basic attack if autoskill is off
++		if (!sd->state.autoskill)
++			autoattack_motion(sd, mob_id);
++		add_timer(gettick() + 250, autoattack_timer, sd->id, data);
++	}
++	return 0;
++}
++
++ACMD_FUNC(autoattack) {
++	nullpo_retr(-1, sd);
++	int mob_id = 0;
++
++	if (!message || !*message) {
++		clif_displaymessage(fd, "Usage:");
++		clif_displaymessage(fd, "@autoattack on - Attack all monsters");
++		clif_displaymessage(fd, "@autoattack off - Deactivate auto attack");
++		clif_displaymessage(fd, "@autoattack range <1-11> - Set target detection range (default 11)");
++		return 0;
++	}
++
++	if (strncmp(message, "range ", 6) == 0) {
++		int range;
++		if (sscanf(message + 6, "%d", &range) != 1 || range < 1 || range > 11) {
++			clif_displaymessage(fd, "Invalid range. Usage: @autoattack range <1-11>");
++			return -1;
++		}
++		sd->autoattack_range = (uint8)range;
++		char output[CHAT_SIZE_MAX];
++		sprintf(output, "Auto attack detection range set to %d.", range);
++		clif_displaymessage(fd, output);
++		return 0;
++	}
++
++	if (strcmp(message, "off") == 0) {
++		sd->state.autoattack = 0;
++		unit_stop_attack(sd);
++		clif_displaymessage(fd, "Auto Attack has been deactivated.");
++		return 0;
++	}
++
++	if (strcmp(message, "on") == 0) {
++		clif_displaymessage(fd, "Auto Attack: Targeting all monsters.");
++		int mob_id = 0;
++		add_timer(gettick() + 2000, autoattack_timer, sd->id, (intptr_t)mob_id);
++		clif_displaymessage(fd, "Auto Attack is now activated.");
++		sd->state.autoattack = 1;
++		return 0;
++	}
++
++	if (sd->state.autoattack) {
++		sd->state.autoattack = 0;
++		unit_stop_attack(sd);
++		clif_displaymessage(fd, "Auto Attack has been deactivated.");
++	}
++	else {
++		sd->state.autoattack = 1;
++		add_timer(gettick() + 2000, autoattack_timer, sd->id, (intptr_t)mob_id);
++		clif_displaymessage(fd, "Auto Attack activated.");
++	}
++	return 0;
++}
++
++
+ /**
+ * Clone other player's statuses/parameters using method same like ACMD_FUNC(param), doesn't use stat point
+ * Usage: @clonestat <char name/ID>
+
+@@ -11481,6 +12045,8 @@ void atcommand_basecommands(void) {
+ 	 **/
+ 	AtCommandInfo atcommand_base[] = {
+ #include <custom/atcommand_def.inc>
++		ACMD_DEF(autoattack),
++		ACMD_DEF(autoskill),
+ 		ACMD_DEF(mapmove),
+ 		ACMD_DEF(where),
+ 		ACMD_DEF(jumpto),
+
+diff --git a/src/map/pc.hpp b/src/map/pc.hpp
+index 4cb5e9386..56ef147f7 100644
+--- a/src/map/pc.hpp
++++ b/src/map/pc.hpp
+@@ -386,6 +386,13 @@ public:
+ 	status_change sc;
+ 	struct regen_data regen;
+ 	struct regen_data_sub sregen, ssregen;
++	unsigned int autoattack_delay;  // autoattack timer
++	uint8 autoattack_range;  // autoattack target detection range (default 9, max 11)
++	uint8 autoskill_range;   // autoskill target detection range (default 9, max 11)
++	struct s_autoskill {
++		uint16 skill_id;
++		uint16 skill_lv;
++	} autoskill[5]; // priority-ordered autoskill slots
+ 	//NOTE: When deciding to add a flag to state or special_state, take into consideration that state is preserved in
+ 	//status_calc_pc, while special_state is recalculated in each call. [Skotlex]
+ 	struct s_state {
+@@ -416,6 +423,8 @@ public:
+ 		uint32 killable : 1;
+ 		uint32 doridori : 1;
+ 		uint32 ignoreAll : 1;
++		uint32 autoattack : 1; // autoattack
++		uint32 autoskill : 1; // autoskill
+ 		uint32 debug_remove_map : 1; // temporary state to track double remove_map's [FlavioJS]
+ 		uint32 buyingstore : 1;
+ 		uint32 lesseffect : 1;
+
+diff --git a/src/map/skill.cpp b/src/map/skill.cpp
+index 0e5e8172e..39019ad2a 100755
+--- a/src/map/skill.cpp
++++ b/src/map/skill.cpp
+@@ -129,6 +129,39 @@ uint16 skill_name2id(const char* name) {
+ 	return 0;
+ }
+ 
++/**
++ * Search for a skill by partial name or description match, excluding passives.
++ * Checks both aegis name and english description (case-insensitive substring).
++ * @param str Search string
++ * @return Skill ID of first match, or 0 if not found
++ **/
++uint16 skilldb_searchname(const char* str) {
++	if (str == nullptr || *str == '\0')
++		return 0;
++
++	// Pass 1: exact match on desc or aegis name
++	for (const auto& it : skill_db) {
++		std::shared_ptr<s_skill_db> skill = it.second;
++		if (skill == nullptr || skill->inf == INF_PASSIVE_SKILL)
++			continue;
++		if (strcmpi(skill->desc, str) == 0 ||
++			strcmpi(skill->name, str) == 0)
++			return it.first;
++	}
++
++	// Pass 2: substring fallback
++	for (const auto& it : skill_db) {
++		std::shared_ptr<s_skill_db> skill = it.second;
++		if (skill == nullptr || skill->inf == INF_PASSIVE_SKILL)
++			continue;
++		if (stristr(skill->name, str) != nullptr ||
++			stristr(skill->desc, str) != nullptr)
++			return it.first;
++	}
++
++	return 0;
++}
++
+ /**
+  * Get Skill name
+  * @param skill_id
+
+diff --git a/src/map/skill.hpp b/src/map/skill.hpp
+index 73143bd27..b29f0c59e 100644
+--- a/src/map/skill.hpp
++++ b/src/map/skill.hpp
+@@ -574,6 +574,7 @@ uint16 skill_dummy2skill_id(uint16 skill_id);
+ int32 splash_target(block_list* bl);
+ 
+ uint16 skill_name2id(const char* name);
++uint16 skilldb_searchname(const char* str);
+ 
+ int32 skill_isammotype(map_session_data* sd, uint16 skill_id);
+ TIMER_FUNC(skill_castend_id);
